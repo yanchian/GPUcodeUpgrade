@@ -1,0 +1,14 @@
+CASE 1 Stoichiometric Hydrogen Air Case
+NOSHK
+T1 1402.1! initial temperature (preshock)
+RHO1 6.71e-3! initial pressure (preshock)
+REAC
+N2  0.73591
+O2  0.19562
+CH4 0.06847
+END
+ATOL  1.E-10
+RTOL  1.E-11
+TMAX  0.0003
+END
+stop

@@ -1,0 +1,334 @@
+#pragma once
+#include <iostream>
+#include <vector>
+#include "png.h"
+
+enum DisplayTypes { RHO, PRESSUREFOO,
+#ifdef REACTIVE
+FRACTIONPLOT,
+#endif
+XVELOCITYPLOT, YVELOCITYPLOT, VELOCITYPLOT, SCHLIEREN, SOUNDSPEED, VORTICITY, POSVORTICITY, NEGVORTICITY, DISPLAYTYPES };
+enum ColourMode { GREYSCALE, HUE, CUBEHELIX, COLOURMODES };
+
+__device__ unsigned int cubehelix(real v) {
+  const real gamma = 1;
+  const real rgb = 0.5;
+  const real rots = -1.5;
+  const real hue = 1.2;
+
+  real dg = pow(v, gamma);
+  real a  = hue * dg * (1 - dg) / 2;
+  real phi = 2 * M_PI * (rgb / 3 + rots * v);
+
+  real cosphi = a * cos(phi);
+  real sinphi = a * sin(phi);
+
+  real r = dg - 0.14861 * cosphi + 1.78277 * sinphi;
+  real g = dg - 0.29227 * cosphi - 0.90649 * sinphi;
+  real b = dg + 1.97249 * cosphi;
+  if (r < 0) r = 0;
+  if (r > 1) r = 1;
+  if (g < 0) g = 0;
+  if (g > 1) g = 1;
+  if (b < 0) b = 0;
+  if (b > 1) b = 1;
+
+  return (int)(r * 255) | ((int)(g * 255) << 8) | ((int)(b * 255) << 16);
+}
+
+__device__ unsigned int hue(real v) {
+  const real S = 1, V = 1;
+  const real C = V * S;
+  const real H = 240 * (1 - v);
+  const real Hp = H / 60.0;
+  const real X = C * (1 - fabs(fmod(Hp, (real) 2) - 1));
+  real rp, gp, bp;
+  if (0 <= Hp && Hp < 1) {
+    rp = C; gp = X; bp = 0;
+  } else if (1 <= Hp && Hp < 2) {
+    rp = X; gp = C; bp = 0;
+  } else if (2 <= Hp && Hp < 3) {
+    rp = 0; gp = C; bp = X;
+  } else if (3 <= Hp && Hp < 4) {
+    rp = 0; gp = X; bp = C;
+  } else if (4 <= Hp && Hp < 5) {
+    rp = X; gp = 0; bp = C;
+  } else if (5 <= Hp && Hp < 6) {
+    rp = C; gp = 0; bp = X;
+  } else {
+    rp = 0; gp = 0; bp = 0;
+  }
+  const real m = V - C;
+  const real r = rp + m, g = gp + m, b = bp + m;
+
+  return (int)(r * 255) | ((int)(g * 255) << 8) | ((int)(b * 255) << 16);
+}
+
+__device__ unsigned int greyscale(real v) {
+  unsigned int n = 255 * v;
+  return n | (n << 8) | (n << 16);
+}
+__global__ void renderKernel(const typename Mesh<GPU>::type grid, real* data, const int ni, const int nj, int plotVariable, const real DV = 0) {
+  const int overlap = 0;
+  const int i = (blockDim.x - overlap) * blockIdx.x + threadIdx.x,
+            j = (blockDim.y - overlap) * blockIdx.y + threadIdx.y;
+  const int gi = i, gj = j;
+
+  if (i < ni && j < nj) {
+    real p[NUMBER_VARIABLES];
+    conservativeToPrimitive(grid(gi, gj), p);
+
+#ifdef GHOST
+    if (plotVariable != PHI + DISPLAYTYPES && plotVariable != FRACTION + DISPLAYTYPES && grid(gi, gj)[PHI] > 0) {
+      data[ni * j + i] = NAN;
+    } else
+#endif
+#ifdef REACTIVE
+    if (grid.x(gi) <= XCORNER && grid.y(gj) >= YCORNER) {
+      data[ni * j + i] = NAN;
+    } else
+#endif
+    if (plotVariable >= DISPLAYTYPES) {
+      data[ni * j + i] = grid(gi, gj)[plotVariable - DISPLAYTYPES];
+    } else if (plotVariable == RHO) {
+      data[ni * j + i] = grid(gi, gj)[DENSITY];
+    } else if (plotVariable == PRESSUREFOO) {
+      data[ni * j + i] = p[PRESSURE];
+    } else if (plotVariable == FRACTIONPLOT) {
+      data[ni * j + i] = p[Y] / p[DENSITY];
+    } else if (plotVariable == XVELOCITYPLOT) {
+      data[ni * j + i] = grid(gi, gj)[XMOMENTUM] / grid(gi, gj)[DENSITY];
+    } else if (plotVariable == YVELOCITYPLOT) {
+      data[ni * j + i] = grid(gi, gj)[YMOMENTUM] / grid(gi, gj)[DENSITY];
+    } else if (plotVariable == VELOCITYPLOT) {
+      data[ni * j + i] = sqrt(pow(grid(gi, gj)[XMOMENTUM], 2) + pow(grid(gi, gj)[YMOMENTUM], 2))/ grid(gi, gj)[DENSITY];
+    } else if (plotVariable == SCHLIEREN) {
+      const real drhodx = (grid(gi + 1, gj)[DENSITY] - grid(gi - 1, gj)[DENSITY]) / (2.0 * grid.dx());
+      const real drhody = (grid(gi, gj + 1)[DENSITY] - grid(gi, gj - 1)[DENSITY]) / (2.0 * grid.dy());
+  
+       data[ni * j + i] = exp(-1.0 * sqrt(drhodx * drhodx + drhody * drhody));
+//     data[ni * j + i] = exp(-0.01 * sqrt(drhodx * drhodx + drhody * drhody));
+    } else if (plotVariable == SOUNDSPEED) {
+
+// temperature
+       data[ni * j + i] = p[PRESSURE]/p[DENSITY];
+
+      //data[ni * j + i] = soundSpeed(grid(gi, gj));
+
+    } else if (plotVariable == VORTICITY || plotVariable == POSVORTICITY || plotVariable == NEGVORTICITY) {
+      if (i > 0 && j > 0 && i < ni - 1 && j < nj - 1) {
+        const real uPlus  = grid(gi, gj + 1)[XMOMENTUM] / grid(i, j + 1)[DENSITY];
+        const real uMinus = grid(gi, gj - 1)[XMOMENTUM] / grid(i, j - 1)[DENSITY];
+
+        const real vPlus  = grid(gi + 1, gj)[YMOMENTUM] / grid(gi + 1, gj)[DENSITY];
+        const real vMinus = grid(gi - 1, gj)[YMOMENTUM] / grid(gi - 1, gj)[DENSITY];
+
+        // second order approximation to du/dz and dv/dx
+        data[ni * j + i] = (uPlus - uMinus) / (2 * grid.dy()) - (vPlus - vMinus) / (2 * grid.dx());
+        if (plotVariable == POSVORTICITY) {
+          data[ni * j + i] = fmax(0, data[ni * j + i]);
+        } else if (plotVariable == NEGVORTICITY) {
+          data[ni * j + i] = fmin(0, data[ni * j + i]);
+        }
+      } else {
+        data[ni * j + i] = 0;
+      }
+    }
+  }
+}
+
+struct limits {
+  real min, max;
+};
+
+template<int blockSize>
+__device__ void getLimitsKernelLastWarp(volatile limits* data, int tid) {
+  #pragma unroll
+  for (int k = 32; k >= 1; k >>= 1) {
+    if (blockSize >= k * 2) {
+      data[tid].max = max(data[tid].max, data[tid + k].max);
+      data[tid].min = min(data[tid].min, data[tid + k].min);
+    }
+  }
+}
+
+template<int blockSize>
+__global__ void getLimitsKernel(const real* plot, const int ni, const int nj, const int width, const int height, Grid2D<limits, GPU> output) {
+  // tid is offset to run from 0...blockSize in 1D
+  const int tid = blockDim.x * threadIdx.y + threadIdx.x;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+  __shared__ limits data[blockSize];
+
+  data[tid].min = 1e30;
+  data[tid].max = -1e30;
+
+  if (i < width && j < height && i < ni && j < nj) {
+    data[tid].min = plot[j * ni + i];
+    data[tid].max = plot[j * ni + i];
+  }
+  __syncthreads();
+
+  #pragma unroll
+  for (int k = blockSize; k > 32; k >>= 1) {
+    if (blockSize >= k * 2) {
+      if (tid < k) {
+        data[tid].max = max(data[tid].max, data[tid + k].max);
+        data[tid].min = min(data[tid].min, data[tid + k].min);
+        __syncthreads();
+      }
+    }
+  }
+  if (tid < 32) getLimitsKernelLastWarp<blockSize>(data, tid);
+
+  output(blockIdx.x, blockIdx.y, 0).min = data[0].min;
+  output(blockIdx.x, blockIdx.y, 0).max = data[0].max;
+}
+
+template<typename T>
+__global__ void normaliseKernel(const real* const data, const int ni, const int nj, const limits l, T* const plot, ColourMode colour) {
+  const int i = blockDim.x * blockIdx.x + threadIdx.x;
+  const int j = blockDim.y * blockIdx.y + threadIdx.y;
+
+  unsigned int value;
+
+  if (i < ni && j < nj) {
+    if (isnan(data[j * ni + i])) {
+      value = 0x808080;
+    } else {
+      real frac = (data[j * ni + i] - l.min) / (l.max - l.min);
+      if (frac < 0) frac = 0;
+      if (frac > 0.999) frac = 0.999;
+      if (colour == GREYSCALE) {
+        value = greyscale(frac);
+      } else if (colour == HUE) {
+        value = hue(frac);
+      } else if (colour == CUBEHELIX) {
+        value = cubehelix(frac);
+      }
+    }
+    if (sizeof(T) == 1) {
+      int offset = 3 * (j * ni + i);
+      plot[offset + 0] = (value >>  0) & 0xFF;
+      plot[offset + 1] = (value >>  8) & 0xFF;
+      plot[offset + 2] = (value >> 16) & 0xFF;
+    } else {
+      plot[j * ni + i] = value;
+    }
+  }
+}
+
+template<typename T>
+limits renderData(typename Mesh<GPU>::type& grid, real* plot_data, T* plot_rgba, int ni, int nj, int plotVariable, ColourMode colourMode, real lMin = 0, real lMax = 0) {
+  dim3 blockDim = dim3(16, 16, 1);
+  dim3 gridDim  = dim3((ni + 15) / 16, (nj + 15) / 16, 1);
+
+  renderKernel<<<gridDim, blockDim>>>(grid, plot_data, ni, nj, plotVariable);
+  cudaThreadSynchronize();
+  checkForError();
+
+  limits l;
+  if (lMin == 0 && lMax == 0) {
+    Grid2D<limits, GPU> outputGPU(gridDim.x, gridDim.y);
+    getLimitsKernel<256><<<gridDim, blockDim>>>(plot_data, ni, nj, ni, nj, outputGPU);
+    cudaThreadSynchronize();
+    checkForError();
+
+    Grid2D<limits, CPU> output(outputGPU);
+    outputGPU.free();
+
+    l.min = 1e100;
+    l.max = -1e100;
+    for (int i = 0; i < output.Nx(); i++) {
+      for (int j = 0; j < output.Ny(); j++) {
+        l.min = min(l.min, output(i, j, 0).min);
+        l.max = max(l.max, output(i, j, 0).max);
+      }
+    }
+    output.free();
+  } else {
+    l.min = lMin;
+    l.max = lMax;
+  }
+
+  normaliseKernel<<<gridDim, blockDim>>>(plot_data, ni, nj, l, plot_rgba, colourMode);
+  cudaThreadSynchronize();
+  checkForError();
+
+  return l;
+}
+
+int WriteBitmap(const char* name, unsigned char* buff, unsigned width, unsigned height, bool flip) {
+  FILE* fp = fopen(name, "wb");
+  if (!fp) {
+    return -1;
+  }
+
+  png_structp png_ptr = png_create_write_struct
+                        (PNG_LIBPNG_VER_STRING, (png_voidp)NULL, NULL, NULL);
+  if (!png_ptr) {
+    return -1;
+  }
+
+  png_infop info_ptr = png_create_info_struct(png_ptr);
+  if (!info_ptr) {
+    png_destroy_write_struct(&png_ptr,
+                             (png_infopp)NULL);
+    return -1;
+  }
+
+  png_init_io(png_ptr, fp);
+
+  png_set_IHDR(png_ptr, info_ptr, width, height, 8,
+               PNG_COLOR_TYPE_RGB,
+               PNG_INTERLACE_NONE,
+               PNG_COMPRESSION_TYPE_DEFAULT,
+               PNG_FILTER_TYPE_DEFAULT);
+
+  png_write_info(png_ptr, info_ptr);
+
+  png_byte* image = (png_byte*)buff;
+
+  unsigned k;
+  png_bytep* row_pointers = new png_bytep[height];
+  for (k = 0; k < height; k++) {
+    row_pointers[k] = image + (flip ? (height - k - 1) : k) * width * 3;
+  }
+
+  png_write_image(png_ptr, row_pointers);
+  png_write_end(png_ptr, info_ptr);
+  png_destroy_write_struct(&png_ptr, &info_ptr);
+  delete[] row_pointers;
+  fclose(fp);
+  return 0;
+}
+
+
+limits saveFrame(typename Mesh<GPU>::type& grid, int plotVariable, ColourMode colourMode, const char* filename, real lMin = 0.0, real lMax = 0.0, real* temp = 0) {
+  int ni = grid.activeNx(), nj = grid.activeNy();
+  real* plot_data;
+  unsigned char* plot_rgba;
+
+  if (temp == 0) {
+    cudaMalloc(&plot_data, ni * nj * sizeof(real));
+    cudaMalloc(&plot_rgba, ni * nj * sizeof(unsigned char) * 3);
+  } else {
+    plot_data = temp;
+    plot_rgba = (unsigned char*) (temp + ni * nj);
+  }
+
+  limits l = renderData(grid, plot_data, plot_rgba, ni, nj, plotVariable, colourMode, lMin, lMax);
+
+  unsigned char* plot_rgba_host = new unsigned char[ni * nj * 3];
+  cudaMemcpy(plot_rgba_host, plot_rgba, ni * nj * 3 * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+  WriteBitmap(filename, plot_rgba_host, ni, nj, false);
+
+  if (temp == 0) {
+    cudaFree(plot_data);
+    cudaFree(plot_rgba);
+  }
+  delete[] plot_rgba_host;
+
+  return l;
+}

@@ -1,0 +1,726 @@
+/*
+  Copyright © Cambridge Numerical Solutions Ltd 2013
+*/
+//#define GHOST
+
+#include <iostream>
+#include <iomanip>
+#include <stack>
+#include <utility>
+#include <libconfig.h++>
+#include <thrust/device_vector.h>
+#include <thrust/reduce.h>
+#ifdef GHOST
+#include "ghostfluid.hpp"
+#endif
+#ifdef REACTIVE
+#include "source.hpp"
+#include "shockdetect.hpp"
+#endif
+#include "initialconditions.hpp"
+#include "SDF/BoundaryMesh.hpp"
+#include "sdf.hpp"
+
+#ifdef GHOST
+class Geometry {
+private:
+  LevelSet<GPU>::type* SDF_;
+public:
+  bool rotating;
+  real omega;
+
+  bool inflow;
+  real entropy;
+  real velocity;
+
+  LevelSet<GPU>::type& SDF() { return *SDF_; }
+  LevelSet<GPU>::type SDF() const { return *SDF_; }
+  LevelSet<GPU>::type*& SDFPointer() { return SDF_; }
+};
+
+template<typename Mesh>
+void SDFShape(Mesh& sdf, const Shape* const shape) {
+  for (int i = -sdf.ghostCells(); i < sdf.activeNx() + sdf.ghostCells(); i++) {
+    for (int j = -sdf.ghostCells(); j < sdf.activeNy() + sdf.ghostCells(); j++) {
+      shape->distance(sdf.x(i, j), sdf(i, j), sdf.d());
+    }
+  }
+}
+
+template<typename Mesh>
+void SDFUnary(Mesh& sdf, const SDFUnaryOperation* const op) {
+  for (int i = -sdf.ghostCells(); i < sdf.activeNx() + sdf.ghostCells(); i++) {
+    for (int j = -sdf.ghostCells(); j < sdf.activeNy() + sdf.ghostCells(); j++) {
+      (*op)(sdf(i, j), sdf(i, j));
+    }
+  }
+}
+template<typename Mesh>
+void SDFBinary(Mesh& sdfa, Mesh& sdfb, const SDFBinaryOperation* const op) {
+  for (int i = -sdfa.ghostCells(); i < sdfa.activeNx() + sdfa.ghostCells(); i++) {
+    for (int j = -sdfa.ghostCells(); j < sdfa.activeNy() + sdfa.ghostCells(); j++) {
+      (*op)(sdfa(i, j), sdfb(i, j), sdfa(i, j));
+    }
+  }
+}
+#endif
+
+class Solver {
+public:
+  double timeFluxes, timeSourcing, timeReducing, timeAdding;
+  int stepNumber;
+  Mesh<GPU>::type* u;
+  Mesh<GPU>::type* fluxes;
+#ifdef GHOST
+  std::vector<Geometry> geometries;
+#endif
+  std::vector<double> outputTimes;
+  std::string outputDirectory;
+  std::vector<double> outputRadii;
+  real targetCFL;
+  int outputNumber;
+  double lastDt;
+  double omega;
+
+public:
+  enum Status {OK, OUTPUT, FINISHED};
+
+private:
+  Solver::Status status;
+
+public:
+  Solver(std::string filename) :
+    lastDt(0.0),
+    timeFluxes(0.0),
+    timeSourcing(0.0),
+    timeReducing(0.0),
+    timeAdding(0.0),
+    stepNumber(0),
+    outputNumber(0)
+  {
+    using namespace libconfig;
+
+    Config config;
+    // automatically cast float <-> int
+    config.setAutoConvert(true);
+    config.readFile(filename.c_str());
+
+    Setting& root = config.getRoot();
+
+    // Parse simulation parameters
+    const Setting& simulation = root["simulation"];
+
+    if (simulation.exists("outputDirectory")) {
+      outputDirectory = simulation["outputDirectory"].c_str();
+    } else {
+      outputDirectory = "";
+    }
+
+    if (simulation.exists("outputRadii")) {
+      for (int i = 0; i < simulation["outputRadii"].getLength(); i++) {
+        outputRadii.push_back(simulation["outputRadii"][i]);
+      }
+    }
+
+    int Nx, Ny;
+    real xMin, xMax, yMin, yMax;
+
+    Nx = simulation["grid"]["cells"]["x"];
+    Ny = simulation["grid"]["cells"]["y"];
+
+    xMin = simulation["grid"]["size"]["x"][0];
+    xMax = simulation["grid"]["size"]["x"][1];
+    yMin = simulation["grid"]["size"]["y"][0];
+    yMax = simulation["grid"]["size"]["y"][1];
+
+    targetCFL = simulation["targetCFL"];
+
+    u = new Mesh<GPU>::type(Nx, Ny, 2, xMin, xMax, yMin, yMax);
+    fluxes = new Mesh<GPU>::type(*u, Mesh<GPU>::type::Allocate);
+
+#ifdef GHOST
+    // read in and initialise the geometry
+    if (root.exists("boundary") && root["boundary"].isList()) {
+      const Setting& boundary = root["boundary"];
+      for (int i = 0; i < boundary.getLength(); i++) {
+        const Setting& geometry = boundary[i]["geometry"];
+        std::stack<LevelSet<CPU>::type*> SDFStack;
+        FixedMatrix<real, 3, 3> transformation;
+        transformation = 0;
+        transformation(0, 0) = transformation(1, 1) = transformation(2, 2) = 1.0;
+
+        for (int j = 0; j < geometry.getLength(); j++) {
+          const Setting& item = geometry[j];
+          if (item.exists("shape")) {
+            LevelSet<CPU>::type* sdf;
+            if (boundary[i].exists("rotating") && (bool)boundary[i]["rotating"]) {
+              sdf = new LevelSet<CPU>::type(2 * Nx, 2 * Ny, 2, xMin, xMax, yMin, yMax);
+            } else {
+              sdf = new LevelSet<CPU>::type(Nx, Ny, 2, xMin, xMax, yMin, yMax);
+            }
+            Shape* shape = NULL;
+            if (std::string(item["shape"].c_str()) == std::string("rectangle")) {
+              Vec corners[2];
+              for (int n = 0; n < 2; n++) for (int m = 0; m < 2; m++) corners[n][m] = item["corners"][n][m];
+              shape = new Rectangle(corners);
+            } else if (std::string(item["shape"].c_str()) == std::string("circle")) {
+              Vec centre;
+              real radius;
+              for (int i = 0; i < 2; i++) centre[i] = item["centre"][i];
+              centre = transformation * centre;
+              radius = item["radius"];
+              shape = new Circle(centre, radius);
+            } else if (std::string(item["shape"].c_str()) == std::string("polygon")) {
+              Polygon<real> polygon;
+              const Setting& points = item["points"];
+              for (int i = 0; i < points.getLength(); i++) {
+                Vec p = transformation * Vec(points[i][0], points[i][1]);
+                if (polygon.points() == 0 || polygon.point(polygon.points() - 1) != p) {
+                  polygon.insertPoint(p);
+                }
+              }
+              for (int i = -sdf->ghostCells(); i < sdf->activeNx() + sdf->ghostCells(); i++) {
+                for (int j = -sdf->ghostCells(); j < sdf->activeNy() + sdf->ghostCells(); j++) {
+                  (*sdf)(i, j, 0) = -1e30;
+                }
+              }
+              BoundaryMesh<2, real> boundary(polygon);
+              boundary.scanConvert(*sdf);
+              fillFractions(*sdf, polygon);
+            } else {
+              std::cerr << "Unknown shape type: " << item["shape"].c_str() << std::endl;
+            }
+            if (shape) {
+              SDFShape(*sdf, shape);
+              delete shape;
+            }
+            SDFStack.push(sdf);
+          } else if (item.exists("operation")) {
+            if (std::string(item["operation"].c_str()) == std::string("union")) {
+              if (SDFStack.size() < 2) {
+                std::cerr << "Stack must have at least two SDFs to perform a union." << std::endl;
+              }
+              LevelSet<CPU>::type* SDFb = SDFStack.top();
+              SDFStack.pop();
+              LevelSet<CPU>::type* SDFa = SDFStack.top();
+              SDFBinaryOperation* op = new SDFUnion;
+              SDFBinary(*SDFa, *SDFb, op);
+
+              SDFb->free();
+              delete SDFb;
+              delete op;
+            } else if (std::string(item["operation"].c_str()) == std::string("intersect")) {
+              if (SDFStack.size() < 2) {
+                std::cerr << "Stack must have at least two SDFs to perform an intersection." << std::endl;
+              }
+              LevelSet<CPU>::type* SDFb = SDFStack.top();
+              SDFStack.pop();
+              LevelSet<CPU>::type* SDFa = SDFStack.top();
+              SDFBinaryOperation* op = new SDFIntersection;
+              SDFBinary(*SDFa, *SDFb, op);
+
+              SDFb->free();
+              delete SDFb;
+              delete op;
+            } else if (std::string(item["operation"].c_str()) == std::string("invert")) {
+              if (SDFStack.size() < 1) {
+                std::cerr << "Stack must have at least one SDF to perform an inversion." << std::endl;
+              }
+              LevelSet<CPU>::type* SDF = SDFStack.top();
+              SDFUnaryOperation* op = new SDFInvert;
+              SDFUnary(*SDF, op);
+
+              delete op;
+            } else {
+              std::cerr << "Unknown operation type: " << item["operation"].c_str() << std::endl;
+            }
+          } else if (item.exists("rotate")) {
+            FixedMatrix<real, 3, 3> t;
+            Vec centre = 0.0;
+            real angle = (real) item["rotate"] * M_PI / 180.0;
+            t = 0.0;
+            t(0, 0) = t(1, 1) = t(2, 2) = 1.0;
+            t(0, 0) = t(1, 1) = cos(angle);
+            t(0, 1) = -sin(angle);
+            t(1, 0) = sin(angle);
+            transformation = transformation * t;
+          } else if (item.exists("translate")) {
+            FixedMatrix<real, 3, 3> t;
+            t = 0.0;
+            t(0, 0) = t(1, 1) = t(2, 2) = 1.0;
+            t(0, 2) = item["translate"][0];
+            t(1, 2) = item["translate"][1];
+            transformation = transformation * t;
+          } else if (item.exists("reset")) {
+            transformation = 0.0;
+            transformation(0, 0) = transformation(1, 1) = transformation(2, 2) = 1.0;
+          } else if (item.exists("matrix")) {
+            FixedMatrix<real, 3, 3> t;
+            for (int i = 0; i < 3; i++) {
+              for (int j = 0; j < 3; j++) {
+                t(i, j) = item["matrix"][i][j];
+              }
+            }
+            transformation = transformation * t;
+          } else {
+            std::cerr << "Not a shape or operation. wtf?" << std::endl;
+          }
+        }
+        if (SDFStack.size() != 1) {
+          std::cerr << "Stack should have length 1 after processing geometry input (has length " << SDFStack.size() << ")." << std::endl;
+        }
+        Geometry g;
+        g.SDFPointer() = new LevelSet<GPU>::type(*SDFStack.top(), LevelSet<GPU>::type::DeepCopy);
+        delete SDFStack.top();
+
+        // read in extra information about this boundary
+        if (boundary[i].exists("rotating") && (bool)boundary[i]["rotating"]) {
+          g.rotating = true;
+          g.omega = boundary[i]["omega"];
+        } else {
+          g.rotating = false;
+        }
+
+        if (boundary[i].exists("inflow")) {
+          g.inflow = true;
+          g.entropy = ((real)boundary[i]["pressure"] + p0()) / pow((real)boundary[i]["density"], gamma());
+          g.velocity = boundary[i]["velocity"];
+        } else {
+          g.inflow = false;
+        }
+        geometries.push_back(g);
+      }
+    }
+#endif // GHOST
+
+    if (simulation.exists("outputTimes")) {
+      for (int i = 0; i < simulation["outputTimes"].getLength(); i++) {
+        outputTimes.push_back(simulation["outputTimes"][i]);
+      }
+    } else {
+      outputTimes.push_back(1e30);
+    }
+
+    dim3 blockDim(64);
+    dim3 gridDim = u->totalCover(blockDim);
+    setInitialConditions<<<gridDim, blockDim>>>(*u);
+    checkForError();
+#ifdef GHOST
+    updateLevelSet();
+#endif
+  }
+
+  Solver::Status step();
+
+  double setBoundaryConditions();
+  template<bool XDIRECTION>
+    double setSpecialBoundaryConditions(void);
+  double getDt(real&);
+  double getXFluxes(real dt);
+  double getYFluxes(real dt);
+  double addXFluxes();
+  double addYFluxes();
+  double checkValidity();
+#ifdef GHOST
+  double updateLevelSet();
+  double getTorque(const Geometry& geometry);
+  double ghost(bool reflect = true);
+  std::pair<real, real> getPressureIntegral(const real radius);
+#endif
+#ifdef REACTIVE
+  double source(real dt);
+  void shockDetect();
+#endif
+  template<bool T>
+    double addFluxes();
+  double getTimeFluxes() { return timeFluxes; }
+  double getTimeSourcing() { return timeSourcing; }
+  double getTimeReducing() { return timeReducing; }
+  double getTimeAdding() { return timeAdding; }
+  double getLastDt() { return lastDt; }
+  int getStepNumber() { return stepNumber; }
+  int getOutputNumber() { return outputNumber; }
+};
+
+Solver::Status Solver::step() {
+  float timeFlux = 0.0, timeReduce = 0.0, timeGhost = 0.0, timeBCs = 0.0;
+
+  if (u->time() >= outputTimes[outputTimes.size() - 1]) {
+    return FINISHED;
+  }
+
+  real dt;
+  timeBCs = setBoundaryConditions();
+#ifdef GHOST
+  timeGhost = ghost(false);
+  timeGhost += updateLevelSet();
+#endif
+  timeReduce = getDt(dt);
+#ifdef GHOST
+  timeGhost += ghost(true);
+#endif
+  timeBCs += setSpecialBoundaryConditions<true>();
+  shockDetect();
+  timeFlux += getXFluxes(dt);
+  timeFlux += addXFluxes();
+  timeBCs += setBoundaryConditions();
+#ifdef GHOST
+  timeGhost += ghost(true);
+#endif
+  timeBCs += setSpecialBoundaryConditions<false>();
+  shockDetect();
+  timeFlux += getYFluxes(dt);
+  timeFlux += addYFluxes();
+#ifdef REACTIVE
+  source(dt);
+#endif
+
+  checkValidity();
+
+  u->time(u->time() + dt);
+
+  timeFluxes += timeFlux;
+  timeAdding += timeBCs;
+  timeReducing += timeReduce;
+  timeSourcing += timeGhost;
+
+  size_t freeMemory, totalMemory;
+  cudaMemGetInfo(&freeMemory, &totalMemory);
+
+  stepNumber++;
+  lastDt = dt;
+  std::cout << "# Step " << stepNumber << "[" << outputNumber << "]: " << std::fixed << std::setprecision(11) << u->time() << " (dt=" << std::setprecision(3) << std::scientific << dt << "). Time {fluxes=" << std::fixed << std::setprecision(3) << timeFlux << "ms, ghost=" << timeGhost << "ms, reduction=" << timeReduce << "ms, BCs=" << timeBCs << "ms}. Memory " << std::fixed << std::setprecision(0) << (float) ((totalMemory - freeMemory) >> 20) << " MiB / " << (float) (totalMemory >> 20) << " MiB" << std::endl;
+
+  return this->status;
+}
+
+double Solver::setBoundaryConditions(void) {
+  cudaEvent_t start, stop;
+  float time;
+
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start, 0);
+  dim3 blockDim(256);
+  dim3 gridDim((max(u->Nx(), u->Ny()) + 255) / 256);
+  setBoundaryConditionsKernel<REFLECTIVE, XDIRECTION, DOWNSTREAM><<<gridDim, blockDim>>>(*u);
+  cudaThreadSynchronize();
+  setBoundaryConditionsKernel<TRANSMISSIVE, XDIRECTION, UPSTREAM><<<gridDim, blockDim>>>(*u);
+  cudaThreadSynchronize();
+
+  setBoundaryConditionsKernel<TRANSMISSIVE, YDIRECTION, DOWNSTREAM><<<gridDim, blockDim>>>(*u);
+  cudaThreadSynchronize();
+  setBoundaryConditionsKernel<TRANSMISSIVE, YDIRECTION, UPSTREAM><<<gridDim, blockDim>>>(*u);
+
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  checkForError();
+  cudaEventElapsedTime(&time, start, stop);
+
+  return time;
+}
+template<bool XDIRECTION>
+double Solver::setSpecialBoundaryConditions(void) {
+  cudaEvent_t start, stop;
+  float time;
+
+  checkForError();
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start, 0);
+  dim3 blockDim(256);
+  dim3 gridDim((max(u->Nx(), u->Ny()) + 255) / 256);
+  setSpecialBoundaryConditionsKernel<XDIRECTION><<<gridDim, blockDim>>>(*u);
+
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  checkForError();
+  cudaEventElapsedTime(&time, start, stop);
+
+  return time;
+}
+double Solver::getDt(real& dt) {
+  cudaEvent_t start, stop;
+  float time;
+
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+	dim3 blockDimReduce(16, 16);
+	dim3 gridDimReduce = u->activeCover(blockDimReduce);
+
+	Grid2D<real, GPU, 1> output(gridDimReduce.x, gridDimReduce.y);
+	checkForError();
+
+  cudaEventRecord(start, 0);
+	getFastestWaveSpeed<256><<<gridDimReduce, blockDimReduce>>>(*u, output);
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+	checkForError();
+	cudaEventElapsedTime(&time, start, stop);
+
+	Grid2D<real, CPU, 1> outputCPU(output);
+	output.free();
+	real maximum = 0.0;
+	for (int i = 0; i < outputCPU.Nx(); i++) {
+	  for (int j = 0; j < outputCPU.Ny(); j++) {
+  		maximum = max(maximum, outputCPU(i, j, 0));
+    }
+	}
+	outputCPU.free();
+
+  real cfl = targetCFL;
+  if (stepNumber < 5) {
+    cfl *= 0.2;
+  }
+
+  dt = targetCFL * min(u->dx(), u->dy()) / maximum;
+  if (u->time() + dt >= outputTimes[outputNumber]) {
+    dt = outputTimes[outputNumber] - u->time();
+    outputNumber++;
+    //if (outputNumber == outputTimes.size()) {
+    //  status = FINISHED;
+    //} else {
+    status = OUTPUT;
+    //}
+  } else {
+    status = OK;
+  }
+
+  return time;
+}
+double Solver::getXFluxes(real dt) {
+  cudaEvent_t start, stop;
+  float time;
+
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start, 0);
+  dim3 blockDim(16, 8);
+  dim3 gridDim = u->totalCover(blockDim, 1, 0);
+
+  getMUSCLFluxes<16, 8, true, true><<<gridDim, blockDim>>>(*u, *fluxes, dt);
+  cudaThreadSynchronize();
+
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  checkForError();
+  cudaEventElapsedTime(&time, start, stop);
+
+  return time;
+}
+double Solver::getYFluxes(real dt) {
+  cudaEvent_t start, stop;
+  float time;
+
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start, 0);
+  dim3 blockDim(8, 16);
+  dim3 gridDim = u->totalCover(blockDim, 0, 1);
+
+  getMUSCLFluxes<8, 16, false, true><<<gridDim, blockDim>>>(*u, *fluxes, dt);
+  cudaThreadSynchronize();
+
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  checkForError();
+  cudaEventElapsedTime(&time, start, stop);
+
+  return time;
+}
+double Solver::addXFluxes(void) {
+  return addFluxes<true>();
+}
+double Solver::addYFluxes(void) {
+  return addFluxes<false>();
+}
+template<bool X>
+double Solver::addFluxes(void) {
+  cudaEvent_t start, stop;
+  float time;
+
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start, 0);
+  dim3 blockDim(32, 16);
+  dim3 gridDim = u->totalCover(blockDim);
+  addFluxesKernel<X, false><<<gridDim, blockDim>>>(*u, *fluxes);
+
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  checkForError();
+  cudaEventElapsedTime(&time, start, stop);
+
+  return time;
+}
+double Solver::checkValidity(void) {
+  cudaEvent_t start, stop;
+  float time;
+
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start, 0);
+  dim3 blockDim(32, 16);
+  dim3 gridDim = u->totalCover(blockDim);
+  //checkValidityKernel<<<gridDim, blockDim>>>(*u);
+
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  checkForError();
+  cudaEventElapsedTime(&time, start, stop);
+
+  return time;
+}
+
+#ifdef GHOST
+double Solver::updateLevelSet() {
+  cudaEvent_t start, stop;
+  float time;
+
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start, 0);
+  dim3 blockDim(16, 16);
+  dim3 gridDim = u->totalCover(blockDim);
+  for (int i = 0; i < geometries.size(); i++) {
+    if (geometries[i].rotating) {
+      combineRotatedLevelSet<<<gridDim, blockDim>>>(*u, geometries[i].SDF(), geometries[i].omega * u->time(), i == 0);
+    } else {
+      combineLevelSet<<<gridDim, blockDim>>>(*u, geometries[i].SDF(), i == 0);
+    }
+    cudaThreadSynchronize();
+  }
+
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  checkForError();
+  cudaEventElapsedTime(&time, start, stop);
+
+  return time;
+}
+
+double Solver::getTorque(const Geometry& geometry) {
+  dim3 blockDim(16, 16);
+  dim3 gridDim = u->totalCover(blockDim);
+
+  Grid2D<real, GPU, 1> torqueField(u->activeNx(), u->activeNy());
+
+  ghostTorque<<<gridDim, blockDim>>>(*u, geometry.SDF(), torqueField, geometry.rotating ?  geometry.omega * u->time() : 0.0);
+  cudaThreadSynchronize();
+
+  real torque = thrust::reduce(
+      thrust::device_ptr<real>(&(torqueField(0, 0, 0))),
+      thrust::device_ptr<real>(&(torqueField(torqueField.Nx() - 1, torqueField.Ny() - 1, 0))),
+      0.0);
+
+  torqueField.free();
+  return torque;
+}
+std::pair<real, real> Solver::getPressureIntegral(const real radius) {
+  dim3 blockDim(16, 16);
+  dim3 gridDim = u->totalCover(blockDim);
+
+  Grid2D<real, GPU, 4> pressureField(u->activeNx(), u->activeNy());
+
+  ghostPressureIntegral<<<gridDim, blockDim>>>(*u, pressureField, radius);
+  cudaThreadSynchronize();
+
+  real integrals[4];
+
+  for (int i = 0; i < 4; i++) {
+    integrals[i] = thrust::reduce(
+        thrust::device_ptr<real>(&(pressureField(0, 0, i))),
+        thrust::device_ptr<real>(&(pressureField(pressureField.Nx() - 1, pressureField.Ny() - 1, i))),
+        0.0);
+  }
+
+  pressureField.free();
+  //std::cout << "torque " << std::setprecision(10) << integrals[0] << " " << integrals[1] << " " << integrals[2] << " " << integrals[3] << std::endl;
+  return std::pair<real, real>(integrals[0] / integrals[1] + integrals[2] / integrals[3], integrals[3] );
+}
+
+double Solver::ghost(const bool reflect) {
+  cudaEvent_t start, stop;
+  float time;
+
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start, 0);
+  dim3 blockDim(16, 16);
+  dim3 gridDim = u->totalCover(blockDim);
+
+  *fluxes = *u;
+  for (int i = 0; i < 20; i++) {
+    ghostIterate<<<gridDim, blockDim>>>(*u, *fluxes);
+    cudaThreadSynchronize();
+    swap(*u, *fluxes);
+  }
+
+  if (reflect) {
+    ghostReflect<<<gridDim, blockDim>>>(*u, omega);
+    cudaThreadSynchronize();
+
+    for (int i = 0; i < geometries.size(); i++) {
+      if (geometries[i].rotating) {
+        ghostAddRotationalVelocity<<<gridDim, blockDim>>>(*u, geometries[i].SDF(), geometries[i].omega * u->time(), geometries[i].omega);
+        cudaThreadSynchronize();
+      }
+      if (geometries[i].inflow) {
+        ghostAddInflow<<<gridDim, blockDim>>>(*u, geometries[i].SDF(), geometries[i].entropy, geometries[i].velocity);
+        cudaThreadSynchronize();
+      }
+    }
+  }
+
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  checkForError();
+  cudaEventElapsedTime(&time, start, stop);
+
+  return time;
+}
+#endif
+
+#ifdef REACTIVE
+double Solver::source(real dt) {
+  cudaEvent_t start, stop;
+  float time;
+
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start, 0);
+  dim3 blockDim(16, 16);
+  dim3 gridDim = u->totalCover(blockDim);
+
+  sources<16, 16><<<gridDim, blockDim>>>(*u, dt);
+  cudaThreadSynchronize();
+
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  checkForError();
+  cudaEventElapsedTime(&time, start, stop);
+
+  return time;
+}
+
+void Solver::shockDetect() {
+  dim3 blockDim(16, 16);
+  dim3 gridDim = u->activeCover(blockDim);
+
+  shockDetectKernel<<<gridDim, blockDim>>>(*u);
+  cudaThreadSynchronize();
+  //shockBurnKernel<<<gridDim, blockDim>>>(u);
+  //cudaThreadSynchronize();
+}
+#endif
+

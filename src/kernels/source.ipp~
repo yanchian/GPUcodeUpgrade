@@ -1,0 +1,97 @@
+/*
+  Copyright © Cambridge Numerical Solutions Ltd 2013
+*/
+#include "source.hpp"
+
+template<int blockDimX, int blockDimY>
+__global__ void sources(Mesh<GPU>::type u, const real dt) {
+	const int dimX = blockDimX,
+	          dimY = blockDimY;
+	const int i = dimX * blockIdx.x + threadIdx.x;
+	const int j = dimY * blockIdx.y + threadIdx.y;
+
+	if (u.active(i, j)) {
+		real c[NUMBER_VARIABLES];
+		real p[NUMBER_VARIABLES];
+		for (int k = 0; k < NUMBER_VARIABLES; k++) {
+			c[k] = u(i, j, k);
+		}
+    const int subcycles = 10;
+		const real ddt = dt / subcycles;
+		if (c[Y] > 0) {
+			for (int k = 0; k < subcycles; k++) {
+				conservativeToPrimitive(c, p);
+
+				const real Ea = 20.0;
+				const real Q0 = 50.0;
+                                const real Q = Q0/GA;
+				const real T = p[PRESSURE]/ (p[DENSITY]);
+			      //  const real B = 3.64212;
+                               // const real B = 4.2685;
+                                const real B = 16.45;
+                               // const real B = 80.235;
+                                real K = 1.0;
+
+                              if (p[PRESSURE] > (1.0+1.0e-7)){
+				K = exp(-B * exp(-Ea /T) * ddt);
+                              } else {
+                                K = 1.0;
+                              }
+				c[ENERGY] += Q * c[Y] * (1.0 - K);
+				c[Y]      *= K;
+			} 
+
+                        for (int k = 0; k < NUMBER_VARIABLES; k++) {
+				u(i, j, k) = c[k];
+			}
+
+		}
+ /*                        if ((u(u.activeNx()-200, u.activeNy()/2, DENSITY)  > (1.0+1.0e-3)) && (j == u.activeNy()/2)){
+                            
+                            for (int ni = 0; ni < u.activeNx()/2; ni++){
+                              for (int nj = 0; nj < u.activeNy(); nj++){
+                                for (int k = 0; k < NUMBER_VARIABLES; k++) {
+                                    u(ni, nj, k)  = u(ni+u.activeNx()/2, nj, k);
+                                }
+                              }
+                            }
+                     
+                            for (int ni = u.activeNx()/2; ni <= u.activeNx(); ni++){
+                              for (int nj = 0; nj <= u.activeNy(); nj++){
+                                u(ni, nj, DENSITY)   = 1.0;
+                                u(ni, nj, XMOMENTUM) = 0.0;
+                                u(ni, nj, YMOMENTUM) = 0.0;
+                                u(ni, nj, ENERGY)    = 1.0 / (gamma() - 1.0);
+
+                                // Layers
+                                                  real FLOOR_real = 0.0, frac = 0.0, x = 0.0;
+                                                    x = u.x(ni);
+                                                    FLOOR_real = (x-x2)/SPACING;
+                                                    int FLOOR = (int) FLOOR_real;
+                                                    if ((FLOOR_real-FLOOR*1.0) <= GA) {
+                                                       frac += 1.0;
+                                                    } else {
+                                                       frac += 0.0;
+                                                    } 
+
+                                // Squares
+                                /*                    real FLOOR_real_x = 0.0, FLOOR_real_y = 0.0, frac = 0.0, x = 0.0, y = 0.0;
+                                                    x = u.x(ni);
+                                                    y = u.y(nj);
+                                                    FLOOR_real_x = (x-x2)/SPACING;
+                                                    FLOOR_real_y = y/SPACING;
+                                                    int FLOOR_x = (int) FLOOR_real_x;
+                                                    int FLOOR_y = (int) FLOOR_real_y;
+                                                    if (((FLOOR_real_x-FLOOR_x*1.0) <= sqrt(GA)) && ((FLOOR_real_y-FLOOR_y*1.0) <= sqrt(GA)) ) {
+                                                       frac += 1.0;
+                                                    } else {
+                                                       frac += 0.0;
+                                                    }  */
+
+//                                u(ni, nj, Y)         = frac * 1.0; 
+//                            } 
+//                        }
+//                  }  
+	}
+}
+

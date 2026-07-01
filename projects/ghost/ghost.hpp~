@@ -1,0 +1,138 @@
+/*
+  Copyright © Cambridge Numerical Solutions Ltd 2013
+*/
+//#define GHOST
+#define REACTIVE
+#pragma once
+#include "core.hpp"
+#include <algorithm>
+#include <iostream>
+#include <iomanip>
+#include <fstream>
+#include <string>
+#include <sstream>
+#include <deque>
+#include <queue>
+#include <ctime>
+#include <cmath>
+#include <typeinfo>
+#include <limits>
+#include <stdio.h>
+#include <stddef.h>
+#include <signal.h>
+#include "boost/thread.hpp"
+#include "Matrix.hpp"
+#include "MatrixOperations.hpp"
+
+#define USE_GL
+
+#define MATERIALS 2
+#define DIMENSIONS 2
+#define GC 2
+
+#include "grid.hpp"
+
+template<Processor P>
+struct Mesh {
+  typedef Mesh2D<real, P, NUMBER_VARIABLES> type;
+};
+
+template<Processor P>
+struct LevelSet {
+  typedef Mesh2D<real, P, 2> type;
+};
+
+StridedCell<real, NUMBER_VARIABLES> typedef Cell;
+
+//const real M = 12.01e-3;
+const real M = 1.0;
+const real R = 1.0;
+const real DCJ=4.8112;
+
+const real y_total =  60.0;
+const real thickness = 150.0;
+
+const real x1 = 10.0;
+const real x2 = 30.0;
+const real VoD = 0.0;
+
+const real SPACING = 10.0;
+const real GA = 0.25;
+
+const real Tol = 1.0e-8;
+
+//const real XCORNER = 0.002;
+//const real YCORNER = 0.00025;
+
+const real XCORNER = 0.00;
+const real YCORNER = 0.00;
+const int XEND = 950;
+const int XHALF = 500;
+const int YEND = 400;
+int time_count = 1;
+
+__device__ __host__ __forceinline__ real gamma(const Cell u) {
+  return 1.2;
+  //return 1.212;
+}
+__device__ __host__ __forceinline__ real gamma() {
+  return 1.2;
+  //return 1.212;
+}
+
+__device__ __host__ __forceinline__ real p0(const Cell u) {
+  return 0.0;
+  //return 0.87e8;
+}
+__device__ __host__ __forceinline__ real p0() {
+  return 0.0;
+  //return 0.87e8;
+}
+
+#include "boundaryconditions.hpp"
+#include "flux.hpp"
+#include "wavespeed.hpp"
+#include "HLLC.hpp"
+#include "Solver.hpp"
+#include "initialconditions.hpp"
+#include "render.hpp"
+#include "opengl.hpp"
+#ifdef GHOST
+#include "ghostfluid.hpp"
+#endif
+#ifdef REACTIVE
+#include "source.hpp"
+#include "shockdetect.hpp"
+#endif
+
+struct ImageOutputs {
+  std::string prefix;
+  int plotVariable;
+  ColourMode colourMode;
+  real min;
+  real max;
+};
+
+#include "SDF/BoundaryMesh.hpp"
+#include "SDF/Polyhedron.cu"
+#include "SDF/ConnectedEdge.cu"
+#include "SDF/Edge.cu"
+#include "SDF/Face.cu"
+#include "SDF/Vertex.cu"
+#include "SDF/ConnectedFace.cu"
+#include "SDF/ConnectedVertex.cu"
+#include "SDF/ScanConvertiblePolygon.cu"
+#include "SDF/ScanConvertiblePolyhedron.cu"
+#include "SDF/BoundaryMesh.cu"
+
+#include "kernels/boundaryconditions.ipp"
+#include "kernels/flux.ipp"
+#ifdef GHOST
+#include "kernels/ghostfluid.ipp"
+#endif
+#ifdef REACTIVE
+#include "kernels/source.ipp"
+#include "kernels/shockdetect.ipp"
+#endif
+#include "kernels/HLLC.ipp"
+#include "kernels/wavespeed.ipp"
