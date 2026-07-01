@@ -1,0 +1,80 @@
+/*
+  Copyright © Cambridge Numerical Solutions Ltd 2013
+*/
+#pragma once
+#include <curand.h>
+#include <curand_kernel.h>
+
+__global__ void setInitialConditions(Mesh<GPU>::type u) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x,
+            j = blockIdx.y * blockDim.y + threadIdx.y;
+
+  const real pAir = 1.0;
+  const real rhoAir = 1.0;
+  const real pShock = 2*21.54;
+  const real rhoShock = 2*1.795;
+ // const real pShock = 2*501.5;
+ // const real rhoShock = 2*1.914;
+  const real uShock = 3.0184;
+  const real WIDTH = sqrt(SPACING*SPACING*GA);
+  real IW_real = WIDTH/u.dx();
+  const int IW = (int) IW_real;
+ 
+  // printf("%f %f\n", pShock, rhoShock);
+
+
+ const int OVERSAMPLE = 1;
+  if (u.active(i, j)) {
+    real frac = 0, density = 0, v_x = 0, v_y = 0, p = 0, x_left = x2, FLOOR_real = 0.0, FLOOR_real_x = 0.0, FLOOR_real_y = 0.0;
+    real POSITION_x = 0.0, POSITION_y = 0.0, RADIUS2 = 0.0;
+    for (int ii = 0; ii < OVERSAMPLE; ii++) {
+      for (int jj = 0; jj < OVERSAMPLE; jj++) {
+        const real x = u.x(i) + u.dx() * ii / OVERSAMPLE, y = u.y(j) + u.dy() * jj / OVERSAMPLE;
+
+        if (x <= x2) {
+                     if (x > x1) {
+                                                    p        += pShock;
+					            density  += 1.0/rhoShock;
+                                 } else {
+                                                    p        += pAir;
+					            density  += 1.0/rhoAir;
+                                 }
+                                                    v_x      += 0.0;
+					            v_y      += 0.0;
+					            frac     += 0.0;
+
+	             } else {
+					            p        += pAir;
+					            density  += 1.0/rhoAir;
+					            v_x      += 0.0;
+					            v_y      += 0.0;
+
+
+                                                 if (y>thickness) {
+                                                    frac += 0.0;
+                                                 } else { 
+                                                    FLOOR_real_x = (x-x2)/SPACING;
+                                                    FLOOR_real_y = y/SPACING+(1.0+sqrt(GA))/2.0;
+                                                    int FLOOR_x = (int) FLOOR_real_x;
+                                                    int FLOOR_y = (int) FLOOR_real_y;
+                                                    if (((FLOOR_real_x-FLOOR_x*1.0) <= sqrt(GA)) && ((FLOOR_real_y-FLOOR_y*1.0) <= sqrt(GA)) ) {
+                                                       frac += 1.0;
+                                                    } else {
+                                                       frac += 0.0;
+                                                    } 
+                                                 } 
+
+				}
+			}
+		}
+
+    frac /= OVERSAMPLE*OVERSAMPLE; density /= OVERSAMPLE*OVERSAMPLE; v_x /= OVERSAMPLE*OVERSAMPLE; v_y /= OVERSAMPLE*OVERSAMPLE; p /= OVERSAMPLE*OVERSAMPLE;
+    density = 1.0 / density;
+    u(i, j, DENSITY)   = density;
+    u(i, j, XMOMENTUM) = v_x * density;
+    u(i, j, YMOMENTUM) = v_y * density;
+    u(i, j, Y)         = frac * density;
+    u(i, j, ENERGY)    = p / (gamma() - 1.0) + 0.5 * density * (v_x * v_x + v_y * v_y);
+  }
+}
+

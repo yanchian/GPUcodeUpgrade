@@ -1,0 +1,460 @@
+/*
+  Copyright © Cambridge Numerical Solutions Ltd 2013
+*/
+#include "ghost.hpp"
+#include <sys/times.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+
+bool halt = false;
+
+void signalHandler(int signal = 0) {
+  halt = true;
+}
+
+int main(int argc, char** argv) {
+  // capture SIGINT
+  signal(SIGINT, signalHandler);
+
+  if (argc < 2) {
+    std::cerr << "Invoke with " << argv[0] << " <configuration file>" << std::endl;
+    exit(1);
+  }
+
+  // select a device
+  int num_devices;
+  cudaGetDeviceCount(&num_devices);
+  std::cout << "#Found " << num_devices << " GPGPUs" << std::endl;
+  cudaDeviceProp properties;
+  int best_device = 0;
+  if (num_devices > 1) {
+    // if there's more than one, pick the one with the highest compute capability
+    int best_computemode = 0, computemode;
+    for (int device = 0; device < num_devices; device++) {
+      cudaGetDeviceProperties(&properties, device);
+      std::cout << "  #" << device << " " << properties.name << ": " << properties.multiProcessorCount << " processors, compute capability " << properties.major << "." << properties.minor << std::endl;
+      computemode = properties.major << 4 + properties.minor;
+      if (best_computemode < computemode) {
+        best_computemode = computemode;
+        best_device = device;
+      }
+    }
+  }
+        best_device = atoi(argv[2]);
+  cudaGetDeviceProperties(&properties, best_device);
+  std::cout << "#  using #" << best_device << " (" << properties.name << ")" << std::endl;
+  cudaSetDevice(best_device);
+
+  // start a timer to get the total wall time at the end of the run
+  struct tms startTimes, endTimes;
+  timespec startClock, endClock;
+  times(&startTimes);
+  clock_gettime(CLOCK_REALTIME, &startClock);
+
+  Solver solver(argv[1]);
+
+  Solver::Status status = Solver::OUTPUT;
+
+  Mesh<CPU>::type uCPU(*solver.u, Mesh<CPU>::type::Allocate);
+
+#ifdef GLOUTPUT
+  OpenGLOutputter outputter(argc, argv, *solver.u);
+  boost::thread outputterThread(boost::ref(outputter));
+#endif
+
+  // open the data file and output a header line
+  std::stringstream filename;
+  filename << solver.outputDirectory << "data";
+
+  std::ofstream dataFile;
+  dataFile.open(filename.str().c_str());
+
+#ifdef GHOST
+  dataFile << "#" << solver.u->time() << "\t\t";
+  for (int i = 0; i < solver.geometries.size(); i++) {
+    if (solver.geometries[i].rotating) {
+      dataFile << "torque on level set " << i << "\t\t";
+    }
+  }
+#endif
+  for (int i = 0; i < solver.outputRadii.size(); i++) {
+    dataFile << "P(r=" << solver.outputRadii[i] << ")\t\t";
+    dataFile << "flux(r=" << solver.outputRadii[i] << ")\t\t";
+  }
+  dataFile << std::endl;
+
+  do {
+#ifdef GLOUTPUT
+    if (solver.getStepNumber() % 1 == 0) {
+      outputter.dispatchDraw(*solver.u);
+      //outputter.paused = true;
+      while (outputter.gridToRender != NULL); // SPIN
+    }
+#endif
+
+    /*if (solver.getStepNumber() % 10 == 0) {
+      dataFile << std::scientific << std::setprecision(10) << solver.u->time() << " ";
+#ifdef GHOST
+      for (int i = 0; i < solver.geometries.size(); i++) {
+        if (solver.geometries[i].rotating) {
+          dataFile  << solver.getTorque(solver.geometries[i]) << " ";
+        }
+      }
+      for (int i = 0; i < solver.outputRadii.size(); i++) {
+        std::pair<real, real> integrals = solver.getPressureIntegral(solver.outputRadii[i]);
+        dataFile << integrals.first << " " << integrals.second << " ";
+      }
+#endif
+      dataFile << std::endl;
+    }*/
+
+/* testing */
+
+uCPU = *solver.u;
+  const real WIDTH = sqrt(SPACING*SPACING*GA);
+  real IW_real = WIDTH/uCPU.dx();
+  int IW = (int) IW_real;
+  time_t t_rand;
+  srand((unsigned) time(&t_rand));
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ /*if (time_count>0){
+    time_count = time_count-2;
+    const real pAir = 1.0;
+    const real rhoAir = 1.0;
+    const real pShock = 2*21.54;
+    const real rhoShock = 2*1.795;
+    real frac = 0, density = 0, v_x = 0, v_y = 0, p = 0;
+        for (int ni = 0; ni < uCPU.activeNx()-IW+1; ni=ni+IW) {
+        for (int nj = 0; nj < uCPU.activeNy()-IW+1; nj=nj+IW) {  
+        real x = uCPU.x(ni), y = uCPU.y(nj);
+
+        if (x <= x2) {
+                     if (x > x1) {
+                                                    p        += pShock;
+					            density  += rhoShock;
+                                 } else {
+                                                    p        += pAir;
+					            density  += rhoAir;
+                                 }
+                                                    v_x      += 0.0;
+					            v_y      += 0.0;
+					            frac     += 0.0;
+
+	             } else {
+					            p        += pAir;
+					            density  += rhoAir;
+					            v_x      += 0.0;
+					            v_y      += 0.0;
+                                                    if (y>=thickness){
+                                                       frac += 0.0;
+                                                    } else {
+                                                       int rand_int = rand() % 10000;                         
+                                                       float myrand =rand_int/10000.0;  
+
+                                                       if (myrand<GA){
+                                                          frac += 1.0;
+                                                       } else {
+                                                          frac += 0.0;
+                                                       }
+                                                    }
+                     }
+                                                      
+
+                     for (int nii = ni; nii < (ni+IW); nii=nii+1) {
+                         for (int njj = nj; njj < (nj+IW); njj=njj+1) {  
+                              uCPU(nii, njj, DENSITY)   = density;
+                              uCPU(nii, njj, XMOMENTUM) = v_x * density;
+                              uCPU(nii, njj, YMOMENTUM) = v_y * density;
+                              uCPU(nii, njj, Y)         = frac * density;
+                              uCPU(nii, njj, ENERGY)    = p / (gamma() - 1.0) + 0.5 * density * (v_x * v_x + v_y * v_y);
+                         }
+                      }
+         }
+     }
+ } */
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+ if (uCPU(uCPU.activeNx()-200, 1)[DENSITY] > (1.0+1.0e-3)){
+                            
+  std::cout << "Hello World " << std::setprecision(2) <<gamma() << std::endl;  
+  
+  for (int ni = 0; ni < uCPU.activeNx()/2; ++ni) {
+  for (int nj = 0; nj < uCPU.activeNy(); ++nj) {  
+ 
+  uCPU(ni, nj)[DENSITY] = uCPU(ni+uCPU.activeNx()/2, nj)[DENSITY];
+    uCPU(ni, nj)[XMOMENTUM]  = uCPU(ni+uCPU.activeNx()/2, nj)[XMOMENTUM];
+    uCPU(ni, nj)[YMOMENTUM] = uCPU(ni+uCPU.activeNx()/2, nj)[YMOMENTUM];
+    uCPU(ni, nj)[ENERGY]  = uCPU(ni+uCPU.activeNx()/2, nj)[ENERGY];
+    uCPU(ni, nj)[Y] = uCPU(ni+uCPU.activeNx()/2, nj)[Y];
+                                }
+                              }
+//Random/////////////////////////////////////////////////////////////////////////////////////////////                              
+  for (int ni = uCPU.activeNx()/2; ni < uCPU.activeNx()-IW+2; ni=ni+IW){
+                              for (int nj = 0; nj < uCPU.activeNy()-IW+1; nj=nj+IW){
+                                real x = uCPU.x(ni);
+                                real y = uCPU.y(nj);
+                                real frac = 0.0;
+                                
+                             if (y>thickness){
+                                frac += 0.0;
+                             } else { 
+                                int rand_int = rand() % 100000;                         
+                                float myrand =rand_int/100000.0;  
+
+                                if (myrand<GA){
+                                   frac += 1.0;
+                                } else {
+                                   frac += 0.0;
+                                } 
+                             } 
+                         
+                                for (int nii = ni; nii < (ni+IW); ++nii) {
+                                for (int njj = nj; njj < (nj+IW); ++njj) {  
+                                uCPU(nii, njj)[DENSITY]    = 1.0;
+                                uCPU(nii, njj)[XMOMENTUM]  = 0.0;
+                                uCPU(nii, njj)[YMOMENTUM]  = 0.0;
+                                uCPU(nii, njj)[Y]         = frac;
+                                uCPU(nii, njj)[ENERGY]     = 1.0 / (gamma() - 1.0);
+                                }
+                                }
+ 
+                              
+  }
+  } 
+
+//Regular/////////////////////////////////////////////////////////////////////////////////////////////
+ /* for (int ni = uCPU.activeNx()/2; ni <= uCPU.activeNx(); ++ni){
+                              for (int nj = 0; nj <= uCPU.activeNy(); ++nj){
+                                uCPU(ni, nj)[DENSITY]   = 1.0;
+                                uCPU(ni, nj)[XMOMENTUM] = 0.0;
+                                uCPU(ni, nj)[YMOMENTUM] = 0.0;
+                                uCPU(ni, nj)[ENERGY]    = 1.0 / (gamma() - 1.0);
+                                real frac = 0.0, x = 0.0, y = 0.0, FLOOR_real = 0.0, FLOOR_real_x = 0.0, FLOOR_real_y = 0.0;
+                                
+             // Squares
+                                x = uCPU.x(ni);
+                                y = uCPU.y(nj);
+                                if (y>thickness){
+                                  frac += 0.0;
+                                } else { 
+                                FLOOR_real_x = (x-x2)/SPACING;
+                                FLOOR_real_y = y/SPACING+(1.0+sqrt(GA))/2.0;
+                                int FLOOR_x = (int) FLOOR_real_x;
+                                int FLOOR_y = (int) FLOOR_real_y;
+                                if (((FLOOR_real_x-FLOOR_x*1.0) <= sqrt(GA)) && ((FLOOR_real_y-FLOOR_y*1.0) <= sqrt(GA)) ) {
+                                   frac += 1.0;
+                                } else {
+                                   frac += 1.0;
+                                }  
+                                  frac += 1.0;
+                                } 
+                                uCPU(ni, nj)[Y] = frac * 1.0;
+  }
+  } */
+} 
+
+*solver.u = uCPU;
+
+      if (status == Solver::OUTPUT) {
+      uCPU = *solver.u;
+
+      if (true) {  
+      
+   /*     std::stringstream filename1;
+        filename1 << solver.outputDirectory << "RESULT" << std::setw(6) << std::setfill('0') << solver.getOutputNumber() << ".plt";
+
+        std::ofstream outFile;
+        outFile.open(filename1.str().c_str());
+
+        outFile.precision(8);
+        outFile << "VARIABLES = \"P\", \"Z\"" << std::endl;
+        outFile << "ZONE I = " << uCPU.activeNx() << " J = " << uCPU.activeNy() << " DATAPACKING = POINT" << std::endl;
+     //   for (int j = 0; j < uCPU.activeNy(); ++j) { 
+          for (int j = 0; j < uCPU.activeNy(); ++j) { 
+          for (int i = 0; i < uCPU.activeNx(); ++i) {
+            real p[NUMBER_VARIABLES];
+            conservativeToPrimitive(uCPU(i, j), p);
+            if (uCPU.x(i) <= XCORNER && uCPU.y(j) >= YCORNER){
+              outFile << std::fixed << uCPU.x(i) << "  " << uCPU.y(j) <<  "  " << 0 << "  " << 0 << std::endl;
+            }else{
+            outFile << std::fixed << p[PRESSURE] << "  " <<  uCPU(i, j)[Y]/uCPU(i, j)[DENSITY] << std::endl;
+            }
+          }
+          } 
+        outFile.close(); */
+
+ 
+        std::stringstream filename1;
+        filename1 << solver.outputDirectory << "PRESSURE" << std::setw(6) << std::setfill('0') << solver.getOutputNumber() << ".vtk";
+
+        std::ofstream outFile1;
+        outFile1.open(filename1.str().c_str());
+
+        outFile1.precision(8);
+        outFile1 << "DIMENSIONS " << uCPU.activeNx() + 1 << " " << uCPU.activeNy() + 1<< " " << 1 << std::endl;
+        outFile1 << "ORIGIN " << 0 << " " << 0 << " " << 0 << std::endl;
+        outFile1 << "SPACING " << uCPU.dx() << " " << uCPU.dy() << " 1" << std::endl;
+        outFile1 << "CELL_DATA " << uCPU.activeNx() * uCPU.activeNy() << std::endl;
+
+       outFile1 << "SCALARS pressure float" << std::endl;
+        outFile1 << "LOOKUP_TABLE default" << std::endl;
+     //   for (int j = 0; j < uCPU.activeNy(); ++j) { 
+          int j = 1;
+          for (int i = 0; i < uCPU.activeNx(); ++i) {
+            real p[NUMBER_VARIABLES];
+            conservativeToPrimitive(uCPU(i, j), p);
+            if (uCPU.x(i) <= XCORNER && uCPU.y(j) >= YCORNER){
+              outFile1 << 0 << std::endl;
+            }else{
+            outFile1 << std::fixed << p[PRESSURE] << std::endl;
+          }
+        } 
+        outFile1.close(); 
+//////////////////////////////////////////////////////////////////////////////////////
+   /*    std::stringstream filename2;
+        filename2 << solver.outputDirectory << "DENSITY" << std::setw(6) << std::setfill('0') << solver.getOutputNumber() << ".vtk";
+
+        std::ofstream outFile2;
+        outFile2.open(filename2.str().c_str());
+
+        outFile2.precision(8);
+       outFile2 << "DIMENSIONS " << uCPU.activeNx() + 1 << " " << uCPU.activeNy() + 1<< " " << 1 << std::endl;
+        outFile2 << "ORIGIN " << 0 << " " << 0 << " " << 0 << std::endl;
+        outFile2 << "SPACING " << uCPU.dx() << " " << uCPU.dy() << " 1" << std::endl;
+        outFile2 << "CELL_DATA " << uCPU.activeNx() * uCPU.activeNy() << std::endl;
+
+        outFile2 << "SCALARS density float" << std::endl;
+        outFile2 << "LOOKUP_TABLE default" << std::endl;
+
+        for (int j = 0; j < uCPU.activeNy(); ++j) {
+          for (int i = 0; i < uCPU.activeNx(); ++i) {
+            if (uCPU.x(i) <= XCORNER && uCPU.y(j) >= YCORNER)
+              outFile2 << 0 << std::endl;
+            else
+            outFile2 << std::fixed << uCPU(i, j)[DENSITY] << std::endl;
+          }
+       } 
+      outFile2.close(); 
+//////////////////////////////////////////////////////////////////////////////////////
+       std::stringstream filename3;
+        filename3 << solver.outputDirectory << "VELOCITY" << std::setw(6) << std::setfill('0') << solver.getOutputNumber() << ".vtk";
+
+        std::ofstream outFile3;
+        outFile3.open(filename3.str().c_str());
+
+       outFile3.precision(8);
+       outFile3 << "DIMENSIONS " << uCPU.activeNx() + 1 << " " << uCPU.activeNy() + 1<< " " << 1 << std::endl;
+        outFile3 << "ORIGIN " << 0 << " " << 0 << " " << 0 << std::endl;
+        outFile3 << "SPACING " << uCPU.dx() << " " << uCPU.dy() << " 1" << std::endl;
+        outFile3 << "CELL_DATA " << uCPU.activeNx() * uCPU.activeNy() << std::endl;
+
+
+     outFile3 << "VECTORS velocity float" << std::endl;
+        for (int j = 0; j < uCPU.activeNy(); ++j) {
+          for (int i = 0; i < uCPU.activeNx(); ++i) {
+            real p[NUMBER_VARIABLES];
+            conservativeToPrimitive(uCPU(i, j), p);
+            if (uCPU.x(i) <= XCORNER && uCPU.y(j) >= YCORNER)
+              outFile3 << "0 0 0" << std::endl;
+            else
+            outFile3 << std::fixed << p[XVELOCITY] << " " << p[YVELOCITY] << " " << 0.0 << std::endl;
+          }
+        } 
+      outFile3.close(); 
+//////////////////////////////////////////////////////////////////////////////////////
+       std::stringstream filename4;
+        filename4 << solver.outputDirectory << "Z" << std::setw(6) << std::setfill('0') << solver.getOutputNumber() << ".vtk";
+
+        std::ofstream outFile4;
+        outFile4.open(filename4.str().c_str());
+
+        outFile4.precision(8);
+       outFile4 << "DIMENSIONS " << uCPU.activeNx() + 1 << " " << uCPU.activeNy() + 1<< " " << 1 << std::endl;
+        outFile4 << "ORIGIN " << 0 << " " << 0 << " " << 0 << std::endl;
+        outFile4 << "SPACING " << uCPU.dx() << " " << uCPU.dy() << " 1" << std::endl;
+        outFile4 << "CELL_DATA " << uCPU.activeNx() * uCPU.activeNy() << std::endl;
+
+        outFile4 << "SCALARS density float" << std::endl;
+        outFile4 << "LOOKUP_TABLE default" << std::endl;
+
+     #ifdef REACTIVE
+        outFile4 << "SCALARS fraction float" << std::endl;
+        outFile4 << "LOOKUP_TABLE default" << std::endl;
+        for (int j = 0; j < uCPU.activeNy(); ++j) {
+          for (int i = 0; i < uCPU.activeNx(); ++i) {
+            if (uCPU.x(i) <= XCORNER && uCPU.y(j) >= YCORNER)
+              outFile4 << 0 << std::endl;
+            else
+            outFile4 << std::fixed << uCPU(i, j)[Y] / uCPU(i, j)[DENSITY] << std::endl;
+          }
+        }
+     #endif
+     outFile4.close(); */
+//////////////////////////////////////////////////////////////////////////////////////
+   /*    std::stringstream filename4;
+        filename4 << solver.outputDirectory << "1D_Average_Profile" << std::setw(6) << std::setfill('0') << solver.getOutputNumber() << ".vtk";
+
+        std::ofstream outFile4;
+        outFile4.open(filename4.str().c_str());
+
+        outFile4.precision(8);
+       outFile4 << "DIMENSIONS " << uCPU.activeNx() + 1 << " " << uCPU.activeNy() + 1<< " " << 1 << std::endl;
+        outFile4 << "ORIGIN " << 0 << " " << 0 << " " << 0 << std::endl;
+        outFile4 << "SPACING " << uCPU.dx() << " " << uCPU.dy() << " 1" << std::endl;
+        outFile4 << "CELL_DATA " << uCPU.activeNx() * uCPU.activeNy() << std::endl;
+
+        outFile4 << "Scalar 1D profiles averaged over Y-direction" << std::endl;
+   
+
+        
+        for (int i = 0; i < uCPU.activeNx(); ++i) {
+          real RHO_SUM = 0.0, RHO_AVG = 0.0, P_SUM = 0.0, P_AVG = 0.0, U_RHO_SUM = 0.0; 
+          real U_RHO_AVG = 0.0, Z_RHO_SUM = 0.0, Z_RHO_AVG = 0.0;
+          for (int j = 0; j < uCPU.activeNy(); ++j) {
+            real p[NUMBER_VARIABLES];
+            conservativeToPrimitive(uCPU(i, j), p);
+            RHO_SUM = RHO_SUM+uCPU(i, j)[DENSITY]*uCPU.dy();
+            P_SUM = P_SUM+p[PRESSURE]*uCPU.dy();
+            U_RHO_SUM = U_RHO_SUM+p[XVELOCITY]*uCPU(i, j)[DENSITY]*uCPU.dy();
+            Z_RHO_SUM = Z_RHO_SUM+uCPU(i, j)[Y]*uCPU.dy();            
+          }
+          P_AVG = P_SUM/(uCPU.activeNy()*uCPU.dy());
+          RHO_AVG = RHO_SUM/(uCPU.activeNy()*uCPU.dy());
+          U_RHO_AVG = U_RHO_SUM/(uCPU.activeNy()*uCPU.dy());
+          Z_RHO_AVG = Z_RHO_SUM/(uCPU.activeNy()*uCPU.dy());
+          outFile4 << std::fixed << P_AVG << "  " << RHO_AVG << "  " << U_RHO_AVG << "  " << Z_RHO_AVG << std::endl;
+        }
+     outFile4.close(); */
+    }
+
+      if (true) {
+        std::vector<ImageOutputs> outputs;
+
+         outputs.push_back((ImageOutputs){"pressure", PRESSUREFOO, HUE, 5.0, 60.0});
+        // outputs.push_back((ImageOutputs){"pressure2", PRESSUREFOO, HUE, 1.0, 50.0});
+      //  outputs.push_back((ImageOutputs){"density", DISPLAYTYPES+DENSITY, HUE, 0.0, 10.0});
+        outputs.push_back((ImageOutputs){"frac", FRACTIONPLOT, HUE, 0.0, 1.0});
+       // outputs.push_back((ImageOutputs){"schlieren", SCHLIEREN, GREYSCALE, 0.0, 10.0});
+      //  outputs.push_back((ImageOutputs){"temperature", SOUNDSPEED, HUE, 1.0, 40.0});
+
+        for (std::vector<ImageOutputs>::iterator iter = outputs.begin(); iter != outputs.end(); ++iter) {
+          std::stringstream filename;
+          filename << solver.outputDirectory << (*iter).prefix << std::setw(6) << std::setfill('0') << solver.getOutputNumber() << ".png";
+          saveFrame(*solver.u, (*iter).plotVariable, (*iter).colourMode, filename.str().c_str(), (*iter).min, (*iter).max, & (*solver.fluxes)(0, 0, 0));
+        }
+      }
+    }
+  } while ((status = solver.step()) != Solver::FINISHED && !halt);
+
+  times(&endTimes);
+  clock_gettime(CLOCK_REALTIME, &endClock);
+  const double wallTime = (endClock.tv_sec - startClock.tv_sec) + (endClock.tv_nsec - startClock.tv_nsec) * 1e-9;
+
+  std::cout << "CPU time, wall= " << std::setprecision(2) << std::fixed << wallTime << "s, user=" << (endTimes.tms_utime - endTimes.tms_utime) << "s, sys=" << (endTimes.tms_stime - endTimes.tms_stime) << "s.  Time for {fluxes=" << solver.getTimeFluxes() * 1e-3 << "s, sources=" << solver.getTimeSourcing() * 1e-3 << "s, reduction=" << solver.getTimeReducing() * 1e-3 << "s, adding=" << solver.getTimeAdding() * 1e-3 << "s}" << std::endl;
+  return 0;
+}
+
+
