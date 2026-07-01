@@ -1,8 +1,0 @@
-Output sequence
-
-i  j  lambda0  lambda1  p  rho 
-
-Note: i and j is the number of the cell. Corresponding x- and y- coordinate should be i/cell and j/cell. cell is the parameter in ghost.hpp
-      In the .vtk file, j = 1100, 1000 and 600, corresponds to the y-plane where y = 55, 50 and 30
-      Temperature T = p/rho
-	  
